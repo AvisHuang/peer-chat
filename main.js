@@ -4,7 +4,30 @@
  */
 
 const CONFIG = {
-    ICE_SERVERS: { iceServers: [{ urls: ['stun:stun1.l.google.com:19302'] }] },
+    ICE_SERVERS: {
+        iceServers: [
+            // 1. Google 的 STUN (問路用)
+            { urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+            
+            // 2. OpenRelay 的免費 TURN (繞路/中繼用)
+            // 注意：這是公開免費資源，不保證永久穩定，正式上線建議申請 Metered.ca 的免費額度
+            {
+                urls: "turn:openrelay.metered.ca:80",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            },
+            {
+                urls: "turn:openrelay.metered.ca:443",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            },
+            {
+                urls: "turn:openrelay.metered.ca:443?transport=tcp",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            }
+        ]
+    },
     API_BASE: '',
     MAX_PARTICIPANTS: 2
 };
@@ -1890,24 +1913,38 @@ class RoomManager {
         this.updateParticipantsUI();
     }
 
+    // --- 改良版 createPeerConnection (含除錯與連線修復) ---
     async createPeerConnection(targetUserId, isInitiator) {
         if (this.peers.has(targetUserId)) return this.peers.get(targetUserId).pc;
 
+        console.log(`[WebRTC] 正在建立與 ${targetUserId} 的連線 (發起者: ${isInitiator})`);
+
         const pc = new RTCPeerConnection(CONFIG.ICE_SERVERS);
-        const remoteStream = new MediaStream();
+        
+        // 修正：直接使用對方的 Stream，不手動組裝，相容性較好
+        // const remoteStream = new MediaStream(); <-- 舊的不需要了
 
         // Add local tracks
         if (this.localStream) {
             this.localStream.getTracks().forEach(track => pc.addTrack(track, this.localStream));
         }
 
-        // Handle remote tracks
+        // ★★★ 關鍵修正 1：更穩定的畫面接收邏輯 ★★★
         pc.ontrack = (event) => {
-            event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+            console.log(`[WebRTC] 收到 ${targetUserId} 的影像串流`);
+            
             const user = this.participants.get(targetUserId);
             if (user) {
+                // 確保視訊卡片存在
                 const videoEl = this.ui.ensureVideoCard(user, user.userId === this.hostUserId);
-                videoEl.srcObject = remoteStream;
+                
+                // 直接使用對方傳過來的原始 Stream (解決 iOS/Safari 黑屏問題)
+                if (event.streams && event.streams[0]) {
+                    videoEl.srcObject = event.streams[0];
+                    
+                    // 嘗試播放 (解決部分瀏覽器自動播放限制)
+                    videoEl.play().catch(e => console.warn('自動播放被阻擋:', e));
+                }
             }
         };
 
@@ -1918,7 +1955,21 @@ class RoomManager {
             }
         };
 
-        this.peers.set(targetUserId, { pc, remoteStream });
+        // ★★★ 關鍵修正 2：加入連線狀態監聽 (這樣才知道發生什麼事) ★★★
+        pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            console.log(`[WebRTC] 與 ${targetUserId} 的連線狀態: ${state}`);
+            
+            if (state === 'failed' || state === 'disconnected') {
+                this.ui.showNotification(`與 ${targetUserId} 的連線不穩定 (${state})`, true);
+            }
+            if (state === 'connected') {
+                console.log(`[WebRTC] 成功連線！應該要看到畫面了`);
+            }
+        };
+
+        // 這裡不需要存 remoteStream 了，因為我們直接用 event.streams[0]
+        this.peers.set(targetUserId, { pc });
 
         if (isInitiator) {
             const offer = await pc.createOffer();
